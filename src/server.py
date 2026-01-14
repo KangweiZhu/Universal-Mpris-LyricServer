@@ -62,12 +62,14 @@ class LyricsServer:
 
     @route("/poll")
     async def poll(self, websocket):
+        global cnt
         try:
             async for message in websocket:
                 try:
                     data = json.loads(message)
                     requested_player = data.get("player")
-                    state = self.manager.poll_status(requested_player)
+                    loop = asyncio.get_running_loop()
+                    state = await loop.run_in_executor(None, self.manager.poll_status, requested_player)
                     await websocket.send(json.dumps(state))
                 except json.JSONDecodeError:
                     await websocket.send(json.dumps({"error": "Invalid JSON"}))
@@ -83,7 +85,8 @@ class LyricsServer:
                     data = json.loads(message)
                     action = data.get("action")
                     player_name = data.get("player")
-                    success = self._execute_control(action, player_name)
+                    loop = asyncio.get_running_loop()
+                    success = await loop.run_in_executor(None, self._execute_control, action, player_name)
                     await websocket.send(json.dumps({"success": success}))
                 except json.JSONDecodeError:
                     await websocket.send(json.dumps({"error": "Invalid JSON"}))

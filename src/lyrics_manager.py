@@ -1,28 +1,38 @@
-import requests
+import json
+import threading
+import urllib.request
+import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from mpris_prober import find_players, find_playing_players
 from mpris_player import MprisPlayer, PlaybackStatus
 
 class LyricsManager:
     """
     Core Controller: Manages player selection, tracking, and lyrics fetching.
-    
+
     Note: ms here == microseconds, not miliseconds.
     """
     def __init__(self):
+        self.lyrics_cache = {}
+        self._fetch_id = 0
         self.setup()
     
     
-    def setup(self, playername=None, playerobj=None, title=None, artist=None, album=None, lyrics=None, current_lyric=None, 
-              playback_status=PlaybackStatus.STOPPED, position_ms=0, mutiplexing=True):
+    def setup(self, playername=None, playerobj=None, title=None, artist=None, album=None,
+              duration=0, identity=None, lyrics=None, current_lyric=None,
+              playback_status=PlaybackStatus.STOPPED, position_ms=0, available_players=None):
         self.playername = playername
         self.playerobj = playerobj
         self.title = title
         self.artist = artist
         self.album = album
+        self.duration = duration
+        self.identity = identity
         self.lyrics = lyrics
         self.current_lyric = current_lyric
         self.playback_status = playback_status
         self.position_ms = position_ms
+        self.available_players = available_players or []
     
     
     def poll_status(self, requested_playername=None):
@@ -54,119 +64,221 @@ class LyricsManager:
         if not playernames:
             return set_free()
         current_playername = self.playername
+        current_playerobj = None
         if requested_playername:
              if requested_playername in playernames:
                  current_playername = requested_playername
              else:
                 return self._get_empty_state()
         else:
-            playing_playernames = find_playing_players()
-            playernames = find_players()
-            if not playing_playernames:
-                if playernames:
+            # Global mode: find the best player
+            # If we have a current player, check if it's still valid
+            if self.playername and self.playername in playernames:
+                try:
+                    player = MprisPlayer(self.playername)
+                    if player.obj:
+                        if player.playback_status == PlaybackStatus.PLAYING:
+                            # Current player is playing, use it
+                            current_playername = self.playername
+                            current_playerobj = player
+                        else:
+                            # Current player paused/stopped, check for other playing players
+                            playing_playernames = find_playing_players(playernames)
+                            if playing_playernames:
+                                current_playername = playing_playernames[0]
+                            else:
+                                # No playing player, keep current one
+                                current_playername = self.playername
+                                current_playerobj = player
+                except Exception:
+                    pass
+            # No valid current player, find one
+            if not current_playerobj:
+                playing_playernames = find_playing_players(playernames)
+                if playing_playernames:
+                    current_playername = playing_playernames[0]
+                elif playernames:
                     current_playername = playernames[0]
                 else:
                     return set_free()
-            else:
-                current_playername = playing_playernames[0]
-        current_playerobj = MprisPlayer(current_playername)    
+                current_playerobj = MprisPlayer(current_playername)
         if not current_playerobj:
+            current_playerobj = MprisPlayer(current_playername)
+        if not current_playerobj.obj:
             return set_free()
-        if self.title != current_playerobj.track_info['title'] \
-                or self.artist != current_playerobj.track_info['artist'] \
-                or self.album != current_playerobj.track_info['album']:
-            self._fetch_lyrics(current_playername, current_playerobj)  
+        # Cache DBus properties to avoid repeated calls
+        try:
+            track_info = current_playerobj.track_info
+            playback_status = current_playerobj.playback_status
+            position = current_playerobj.position
+            identity = current_playerobj.identity
+        except Exception:
+            return set_free()
+        track_changed = (self.title != track_info['title']
+                or self.artist != track_info['artist']
+                or self.album != track_info['album'])
+        if track_changed:
+            self.title = track_info['title']
+            self.artist = track_info['artist']
+            self.album = track_info['album']
+            # Check if this player has cached lyrics for current track
+            cached = self.lyrics_cache.get(current_playername)
+            if (cached and cached['title'] == track_info['title']
+                    and cached['artist'] == track_info['artist']
+                    and cached['album'] == track_info['album']):
+                self.lyrics = cached['lyrics']
+            else:
+                self.lyrics = None
+                self._fetch_id += 1
+                threading.Thread(target=self._fetch_lyrics, args=(current_playername, track_info, self._fetch_id), daemon=True).start()
+        self.position_ms = position
         current_lyric = self._get_current_lyric()
         self.setup(
             playername=current_playername,
             playerobj=current_playerobj,
-            title=current_playerobj.track_info['title'],
-            artist=current_playerobj.track_info['artist'],
-            album=current_playerobj.track_info['album'],
+            title=track_info['title'],
+            artist=track_info['artist'],
+            album=track_info['album'],
+            duration=track_info['length'],
+            identity=identity,
             lyrics=self.lyrics,
             current_lyric=current_lyric,
-            playback_status=current_playerobj.playback_status,
-            position_ms=current_playerobj.position
+            playback_status=playback_status,
+            position_ms=position,
+            available_players=playernames
         )
         return self.get_state()
 
 
-    def _fetch_lyrics(self, playername, playerobj):
-        title = playerobj.track_info['title']
-        artists = playerobj.track_info['artist']
+    def _fetch_lyrics(self, playername, track_info, fetch_id):
+        # Check if this fetch is still current
+        if self._fetch_id != fetch_id:
+            return
+        title = track_info['title']
+        artists = track_info['artist']
         artist = artists[0] if artists else ''
-        album = playerobj.track_info['album']
-        length = playerobj.track_info['length']
+        album = track_info['album']
+        length = track_info['length']
         if not title or not artists:
-            self.lyrics = None
             return
         try:
+            lyrics = None
             if playername == 'org.mpris.MediaPlayer2.yesplaymusic':
-                self._fetch_lyrics_ypm(title)
+                lyrics = self._fetch_lyrics_ypm(title)
             elif playername == 'org.mpris.MediaPlayer2.lx-music-desktop':
-                self._fetch_lyrics_lxmusic()
+                lyrics = self._fetch_lyrics_lxmusic()
             else:
-                self._fetch_lyrics_lrclib(title, artist, album, length)
+                # Check again before expensive HTTP calls
+                if self._fetch_id != fetch_id:
+                    return
+                lyrics = self._fetch_lyrics_lrclib(title, artist, album, length)
+            # Only write if this fetch is still current
+            if self._fetch_id == fetch_id:
+                self.lyrics = lyrics
+                if lyrics:
+                    self.lyrics_cache[playername] = {
+                        'title': title,
+                        'artist': artists,
+                        'album': album,
+                        'lyrics': lyrics
+                    }
         except Exception as e:
-            self.lyrics = None
+            if self._fetch_id == fetch_id:
+                self.lyrics = None
 
+
+    def _http_get(self, url, timeout=5):
+        """Simple HTTP GET using urllib. Returns (status_code, data) tuple."""
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as resp:
+                return resp.status, resp.read().decode('utf-8')
+        except Exception:
+            return None, None
 
     def _fetch_lyrics_ypm(self, title):
-        """Fetch lyrics from YesPlayMusic localhost API"""
+        """Fetch lyrics from YesPlayMusic localhost API. Returns parsed lyrics or None."""
         ypm_base_url = "http://localhost:27232"
-        response = requests.get(f"{ypm_base_url}/player", timeout=5)
-        if response.status_code != 200:
-            self.lyrics = None
-            return
-        data = response.json()
+        status, text = self._http_get(f"{ypm_base_url}/player")
+        if status != 200:
+            return None
+        data = json.loads(text)
         if not data or not data.get('currentTrack') or data['currentTrack'].get('name') != title:
-            self.lyrics = None
-            return
+            return None
         track_id = data['currentTrack']['id']
-        response = requests.get(f"{ypm_base_url}/api/lyric?id={track_id}", timeout=5)
-        if response.status_code != 200:
-            self.lyrics = None
-            return
-        data = response.json()
+        status, text = self._http_get(f"{ypm_base_url}/api/lyric?id={track_id}")
+        if status != 200:
+            return None
+        data = json.loads(text)
         if data and data.get('lrc') and data['lrc'].get('lyric'):
-            self.lyrics = self._parse_lrc(data['lrc']['lyric'])
-        else:
-            self.lyrics = None
-
+            return self._parse_lrc(data['lrc']['lyric'])
+        return None
 
     def _fetch_lyrics_lxmusic(self, port=23330):
-        """Fetch lyrics from LX Music localhost API"""
+        """Fetch lyrics from LX Music localhost API. Returns parsed lyrics or None."""
         lxmusic_base_url = f"http://localhost:{port}"
-        response = requests.get(f"{lxmusic_base_url}/lyric", timeout=5)
-        if response.status_code == 200 and response.text:
-            self.lyrics = self._parse_lrc(response.text)
-        else:
-            self.lyrics = None
-
+        status, text = self._http_get(f"{lxmusic_base_url}/lyric")
+        if status == 200 and text:
+            return self._parse_lrc(text)
+        return None
 
     def _fetch_lyrics_lrclib(self, title, artist, album, length):
-        """Fetch lyrics from lrclib.net (compatible mode)"""
-        synced_lyrics = None
+        """Fetch lyrics from lrclib.net (compatible mode). Returns parsed lyrics or None."""
         duration_sec = length // 1000000 if length else None
-        if duration_sec:
-            url = f"https://lrclib.net/api/get?track_name={title}&artist_name={artist}&album_name={album}&duration={duration_sec}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                synced_lyrics = data.get('syncedLyrics')
-        if not synced_lyrics:
-            url = f"https://lrclib.net/api/search?track_name={title}&artist_name={artist}&album_name={album}"
-            response = requests.get(url, timeout=5)
-            if response.status_code == 200:
-                data = response.json()
+        params = urllib.parse.urlencode({
+            'track_name': title,
+            'artist_name': artist,
+            'album_name': album
+        })
+
+        def fetch_exact():
+            if not duration_sec:
+                return None
+            url = f"https://lrclib.net/api/get?{params}&duration={duration_sec}"
+            status, text = self._http_get(url)
+            if status == 200 and text:
+                data = json.loads(text)
+                return data.get('syncedLyrics')
+            return None
+
+        def fetch_search():
+            url = f"https://lrclib.net/api/search?{params}"
+            status, text = self._http_get(url)
+            if status == 200 and text:
+                data = json.loads(text)
                 for result in data:
                     if result.get('syncedLyrics'):
-                        synced_lyrics = result['syncedLyrics']
-                        break
-        if synced_lyrics:
-            self.lyrics = self._parse_lrc(synced_lyrics)
-        else:
-            self.lyrics = None
+                        return result['syncedLyrics']
+            return None
+
+        def fetch_fuzzy():
+            url = f"https://lrclib.net/api/search?q={urllib.parse.quote(title)}"
+            status, text = self._http_get(url)
+            if status == 200 and text:
+                data = json.loads(text)
+                for result in data:
+                    if result.get('syncedLyrics'):
+                        return result['syncedLyrics']
+            return None
+
+        # Run all fetches in parallel
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {
+                executor.submit(fetch_exact): 0,
+                executor.submit(fetch_search): 1,
+                executor.submit(fetch_fuzzy): 2,
+            }
+            results = [None, None, None]
+            for future in as_completed(futures):
+                priority = futures[future]
+                try:
+                    results[priority] = future.result()
+                except Exception:
+                    pass
+        # Pick best result by priority
+        for result in results:
+            if result:
+                return self._parse_lrc(result)
+        return None
 
 
     def _parse_lrc(self, lrc_text):
@@ -194,11 +306,17 @@ class LyricsManager:
         while start <= end:
             mid = (start + end) >> 1
             if self.position_ms == self.lyrics[mid]['time_ms']:
-                return self.lyrics[mid]['lyric']
+                end = mid
+                break
             if self.position_ms > self.lyrics[mid]['time_ms']:
                 start = mid + 1
             else:
                 end = mid - 1
+        if end < 0:
+            return None
+        # If current lyric is empty, find the previous non-empty one
+        while end >= 0 and not self.lyrics[end]['lyric']:
+            end -= 1
         if end < 0:
             return None
         return self.lyrics[end]['lyric']       
@@ -207,24 +325,23 @@ class LyricsManager:
     def get_state(self):
         if not self.playerobj:
             return self._get_empty_state()
-        track_info = self.playerobj.track_info
         return {
             "playback_status": self.playback_status.value.lower(),
             "player": {
-                "identity": self.playerobj.identity,
+                "identity": self.identity,
                 "bus_name": self.playername
             },
             "track": {
-                "title": track_info['title'],
-                "artist": ", ".join(track_info['artist']) if track_info['artist'] else "",
-                "album": track_info['album'],
-                "duration": track_info['length']
+                "title": self.title,
+                "artist": ", ".join(self.artist) if self.artist else "",
+                "album": self.album,
+                "duration": self.duration
             },
             "position_ms": self.position_ms,
             "lyrics": {
                 'current_lyric': self.current_lyric,
             },
-            "available_players": find_players()
+            "available_players": self.available_players
         }
 
 

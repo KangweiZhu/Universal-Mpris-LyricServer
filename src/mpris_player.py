@@ -6,6 +6,16 @@ MPRIS_ROOT_IFACE = 'org.mpris.MediaPlayer2'
 MPRIS_PLAYER_IFACE = 'org.mpris.MediaPlayer2.Player'
 MPRIS_OBJECT_PATH = '/org/mpris/MediaPlayer2'
 
+# Cached DBus session bus
+_session_bus = None
+
+def get_session_bus():
+    """Get or create a cached DBus session bus."""
+    global _session_bus
+    if _session_bus is None:
+        _session_bus = dbus.SessionBus()
+    return _session_bus
+
 
 class PlaybackStatus(Enum):
     PLAYING = "Playing"
@@ -20,7 +30,7 @@ class MprisPlayer:
     """
     def __init__(self, dbus_identifier):
         self.dbus_identifier = dbus_identifier
-        self.bus = dbus.SessionBus()
+        self.bus = get_session_bus()
         try:
             self.obj = self.bus.get_object(dbus_identifier, MPRIS_OBJECT_PATH)
             self.props_iface = dbus.Interface(self.obj, DBUS_PROPERTIES_IFACE)
@@ -202,23 +212,34 @@ class MprisPlayer:
         return dict(val) if val else {}
 
 
+    def _unwrap_str(self, val):
+        return str(val) if val else ''
+
+    def _unwrap_list(self, val):
+        if not val:
+            return []
+        # Handle case where val is a string instead of list
+        if isinstance(val, str):
+            return [val]
+        return [str(v) for v in val]
+
     @property
     def track_info(self):
         """Extract commonly used track info from metadata."""
         meta = self.metadata
         return {
-            'title': meta.get('xesam:title', ''),
-            'artist': meta.get('xesam:artist', []),
-            'album': meta.get('xesam:album', ''),
-            'art_url': meta.get('mpris:artUrl', ''),
-            'length': meta.get('mpris:length', 0), # microseconds
-            'track_id': meta.get('mpris:trackid', ''),
-            'genre': meta.get('xesam:genre', []),
-            'composer': meta.get('xesam:composer', []),
-            'lyricist': meta.get('xesam:lyricist', []),
-            'track_number': meta.get('xesam:trackNumber', 0),
-            'disc_number': meta.get('xesam:discNumber', 0),
-            'lyrics': meta.get('xesam:asText', ''),
+            'title': self._unwrap_str(meta.get('xesam:title', '')),
+            'artist': self._unwrap_list(meta.get('xesam:artist', [])),
+            'album': self._unwrap_str(meta.get('xesam:album', '')),
+            'art_url': self._unwrap_str(meta.get('mpris:artUrl', '')),
+            'length': int(meta.get('mpris:length', 0)),
+            'track_id': self._unwrap_str(meta.get('mpris:trackid', '')),
+            'genre': self._unwrap_list(meta.get('xesam:genre', [])),
+            'composer': self._unwrap_list(meta.get('xesam:composer', [])),
+            'lyricist': self._unwrap_list(meta.get('xesam:lyricist', [])),
+            'track_number': int(meta.get('xesam:trackNumber', 0)),
+            'disc_number': int(meta.get('xesam:discNumber', 0)),
+            'lyrics': self._unwrap_str(meta.get('xesam:asText', '')),
         }
 
 
